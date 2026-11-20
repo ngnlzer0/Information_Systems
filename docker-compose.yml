@@ -1,0 +1,184 @@
+name: information-systems
+
+# Усі змінні беруться з файлу .env (шаблон: .env.example).
+# Назовні опубліковані лише: шлюз nginx (8080), а також Prometheus і PostgreSQL
+# на 127.0.0.1 (для навчальних дослідів). Grafana, Loki, Tempo і сервіс
+# авторизації доступні тільки всередині docker-мережі.
+
+services:
+  # ---------------------------------------------------------------- 0. СУБД
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Задайте POSTGRES_PASSWORD у .env}
+      POSTGRES_DB: ${POSTGRES_DB:-shop}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Задайте APP_DB_PASSWORD у .env}
+      MONITOR_DB_PASSWORD: ${MONITOR_DB_PASSWORD:?Задайте MONITOR_DB_PASSWORD у .env}
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - log_min_duration_statement=500
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-shop}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ------------------------------------- 1. Генерація/актуалізація даних в БД
+  generator:
+    build:
+      context: .
+      dockerfile: generator/Dockerfile
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_NAME: ${POSTGRES_DB:-shop}
+      DB_USER: app_user
+      DB_PASSWORD: ${APP_DB_PASSWORD}
+      GEN_INTERVAL_SECONDS: ${GEN_INTERVAL_SECONDS:-0.5}
+      LOKI_URL: http://loki:3100
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+    depends_on:
+      postgres:
+        condition: service_healthy
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+
+  # ------------------------------ 2. Збір даних: експортер метрик СУБД (Python)
+  db-exporter:
+    build:
+      context: .
+      dockerfile: exporter/Dockerfile
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_NAME: ${POSTGRES_DB:-shop}
+      DB_USER: monitor_user
+      DB_PASSWORD: ${MONITOR_DB_PASSWORD}
+      LOKI_URL: http://loki:3100
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------- 2-3. Prometheus: збір метрик + вбудована TSDB (Time Series Storage)
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  # ------------------------------------------------ 5. Grafana Loki (логи)
+  loki:
+    image: grafana/loki:3.4.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
+
+  # ---------------------------------------------- 6. Grafana Tempo (трейси)
+  tempo:
+    image: grafana/tempo:2.7.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo.yaml"]
+    # root потрібен лише щоб named volume був доступний для запису (навчальний проєкт)
+    user: root
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+
+  # --------------------------------------------- 4. Grafana (відображення)
+  grafana:
+    image: grafana/grafana:11.5.2
+    restart: unless-stopped
+    environment:
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:8080/}
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Задайте GRAFANA_ADMIN_PASSWORD у .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Авторизацію виконує шлюз nginx + сервіс auth; Grafana довіряє заголовку,
+      # який шлюз виставляє після успішної перевірки.
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-WEBAUTH-USER
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # ----------------------------------------------- 7. Сервер авторизації
+  auth:
+    build:
+      context: .
+      dockerfile: auth/Dockerfile
+    restart: unless-stopped
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Задайте JWT_SECRET у .env}
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Задайте ADMIN_PASSWORD у .env}
+      JWT_TTL_SECONDS: ${JWT_TTL_SECONDS:-3600}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      AUTH_DB_PATH: /data/auth.db
+      LOKI_URL: http://loki:3100
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+    volumes:
+      - auth_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ----------- Єдина публічна точка входу: перевірка авторизації перед Grafana
+  gateway:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${GATEWAY_PORT:-8080}:80"
+    depends_on:
+      auth:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  loki_data:
+  tempo_data:
+  grafana_data:
+  auth_data:

@@ -1,0 +1,8 @@
+Flask>=3.0,<4
+gunicorn>=22.0
+PyJWT>=2.8,<3
+prometheus-client>=0.20
+requests>=2.31
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp-proto-http>=1.27
+opentelemetry-instrumentation-flask>=0.48b0
